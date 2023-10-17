@@ -45,7 +45,6 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 public class ParameterContextIT extends NiFiSystemIT {
-
     @Test
     public void testCreateParameterContext() throws NiFiClientException, IOException {
         final Set<ParameterEntity> parameterEntities = new HashSet<>();
@@ -222,6 +221,7 @@ public class ParameterContextIT extends NiFiSystemIT {
     public void testProcessorRestartedWhenParameterChanged() throws NiFiClientException, IOException, InterruptedException {
         testProcessorRestartedWhenParameterChanged("#{name}");
     }
+
 
     @Test
     public void testProcessorRestartedWhenParameterChangedWhenReferencedThroughEL() throws NiFiClientException, IOException, InterruptedException {

@@ -223,6 +223,7 @@ import org.apache.nifi.util.ReflectionUtils;
 import org.apache.nifi.util.concurrency.TimedLock;
 import org.apache.nifi.web.api.dto.PositionDTO;
 import org.apache.nifi.web.api.dto.status.StatusHistoryDTO;
+import org.apache.nifi.web.revision.RevisionManager;
 import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -269,10 +270,8 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
     public static final String DEFAULT_SWAP_MANAGER_IMPLEMENTATION = "org.apache.nifi.controller.FileSystemSwapManager";
     public static final String DEFAULT_COMPONENT_STATUS_REPO_IMPLEMENTATION = "org.apache.nifi.controller.status.history.VolatileComponentStatusRepository";
 
-    public static final String SCHEDULE_MINIMUM_NANOSECONDS = "flowcontroller.minimum.nanoseconds";
     public static final String GRACEFUL_SHUTDOWN_PERIOD = "nifi.flowcontroller.graceful.shutdown.seconds";
     public static final long DEFAULT_GRACEFUL_SHUTDOWN_SECONDS = 10;
-    public static final int METRICS_RESERVOIR_SIZE = 288; // 1 day worth of 5-minute captures
 
 
     // default properties for scaling the positions of components from pre-1.0 flow encoding versions.
@@ -308,18 +307,14 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
     private final StateManagerProvider stateManagerProvider;
     private final long systemStartTime = System.currentTimeMillis(); // time at which the node was started
     private final VariableRegistry variableRegistry;
+    private final RevisionManager revisionManager;
 
     private final ConnectionLoadBalanceServer loadBalanceServer;
     private final NioAsyncLoadBalanceClientRegistry loadBalanceClientRegistry;
     private final FlowEngine loadBalanceClientThreadPool;
     private final Set<NioAsyncLoadBalanceClientTask> loadBalanceClientTasks = new HashSet<>();
 
-    private final ConcurrentMap<String, ProcessorNode> allProcessors = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ProcessGroup> allProcessGroups = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, Connection> allConnections = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, Port> allInputPorts = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, Port> allOutputPorts = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, Funnel> allFunnels = new ConcurrentHashMap<>();
 
     private final ZooKeeperStateServer zooKeeperStateServer;
 
@@ -433,7 +428,8 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
                 /* leader election manager */ null,
                 /* variable registry */ variableRegistry,
                 flowRegistryClient,
-                extensionManager);
+                extensionManager,
+                null);
     }
 
     public static FlowController createClusteredInstance(
@@ -449,7 +445,8 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
             final LeaderElectionManager leaderElectionManager,
             final VariableRegistry variableRegistry,
             final FlowRegistryClient flowRegistryClient,
-            final ExtensionManager extensionManager) {
+            final ExtensionManager extensionManager,
+            final RevisionManager revisionManager) {
 
         final FlowController flowController = new FlowController(
                 flowFileEventRepo,
@@ -465,7 +462,8 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
                 leaderElectionManager,
                 variableRegistry,
                 flowRegistryClient,
-                extensionManager);
+                extensionManager,
+                revisionManager);
 
         return flowController;
     }
@@ -485,7 +483,8 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
             final LeaderElectionManager leaderElectionManager,
             final VariableRegistry variableRegistry,
             final FlowRegistryClient flowRegistryClient,
-            final ExtensionManager extensionManager) {
+            final ExtensionManager extensionManager,
+            final RevisionManager revisionManager) {
 
         maxTimerDrivenThreads = new AtomicInteger(10);
         maxEventDrivenThreads = new AtomicInteger(1);
@@ -500,6 +499,7 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
         this.auditService = auditService;
         this.configuredForClustering = configuredForClustering;
         this.flowRegistryClient = flowRegistryClient;
+        this.revisionManager = revisionManager;
 
         try {
             // Form the container object from the properties
@@ -2209,6 +2209,8 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
             throw new IllegalStateException("Unable to stop heartbeating because heartbeating is not configured.");
         }
 
+        LOG.info("Will no longer send heartbeats");
+
         writeLock.lock();
         try {
             if (!isHeartbeating()) {
@@ -2388,12 +2390,7 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
             // update the bulletin repository
             if (isChanging) {
                 if (clustered) {
-                    registerForPrimaryNode();
-
-                    // Participate in Leader Election for Heartbeat Monitor. Start the heartbeat monitor
-                    // if/when we become leader and stop it when we lose leader role
-                    registerForClusterCoordinator(true);
-
+                    onClusterConnect();
                     leaderElectionManager.start();
                     stateManagerProvider.enableClusterProvider();
 
@@ -2420,6 +2417,16 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
         } finally {
             writeLock.unlock("setClustered");
         }
+    }
+
+    public void onClusterConnect() {
+        registerForPrimaryNode();
+
+        // Participate in Leader Election for Heartbeat Monitor. Start the heartbeat monitor
+        // if/when we become leader and stop it when we lose leader role
+        registerForClusterCoordinator(true);
+
+        resumeHeartbeats();
     }
 
     public void onClusterDisconnect() {
@@ -2929,6 +2936,7 @@ public class FlowController implements ReportingTaskProvider, Authorizable, Node
             final HeartbeatPayload hbPayload = new HeartbeatPayload();
             hbPayload.setSystemStartTime(systemStartTime);
             hbPayload.setActiveThreadCount(getActiveThreadCount());
+            hbPayload.setRevisionUpdateCount(revisionManager.getRevisionUpdateCount());
 
             final QueueSize queueSize = getTotalFlowFileCount(bean.getRootGroup());
             hbPayload.setTotalFlowFileCount(queueSize.getObjectCount());
